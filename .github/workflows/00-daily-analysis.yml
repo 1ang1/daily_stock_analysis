@@ -91,6 +91,7 @@ jobs:
           OPENAI_API_KEYS: ${{ secrets.OPENAI_API_KEYS }}
           OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL || secrets.OPENAI_MODEL }}
+          LLM_API_MODE: ${{ vars.LLM_API_MODE || secrets.LLM_API_MODE || 'chat' }}
 
           # DeepSeek
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
