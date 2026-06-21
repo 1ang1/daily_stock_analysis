@@ -13,6 +13,7 @@ A股自选股智能分析系统 - AI分析层
 import json
 import logging
 import math
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -68,7 +69,28 @@ from src.services.daily_market_context import format_daily_market_context_prompt
 from src.market_phase_prompt import format_market_phase_prompt_section
 
 logger = logging.getLogger(__name__)
+def _use_responses_api(model: str) -> bool:
+    """
+    判断当前模型是否使用 OpenAI Responses API。
 
+    LLM_API_MODE=responses 时，只对 OpenAI 协议模型启用，
+    其他模型仍沿用原来的 Chat Completions 调用方式。
+    """
+    api_mode = os.getenv("LLM_API_MODE", "chat").strip().lower()
+
+    if api_mode != "responses":
+        return False
+
+    model_name = (model or "").strip().lower()
+    configured_model = os.getenv("OPENAI_MODEL", "").strip().lower()
+
+    if model_name.startswith("openai/"):
+        return True
+
+    if configured_model:
+        return model_name.split("/")[-1] == configured_model.split("/")[-1]
+
+    return False
 
 def _normalize_risk_warning_values(value: Any) -> List[str]:
     """Normalize arbitrary risk_warning values into a flat list of text alerts."""
@@ -2352,19 +2374,123 @@ class GeminiAnalyzer:
         use_channel_router: bool,
         router_model_names: set[str],
     ) -> Any:
-        """Dispatch a LiteLLM completion through router or direct fallback."""
-        wire_models = resolve_fallback_litellm_wire_models(model, config.llm_model_list)
+        """
+        根据配置调用 Chat Completions API 或 Responses API。
+
+        默认保持原有 Chat Completions 行为；
+        当 LLM_API_MODE=responses 时，OpenAI 模型改用
+        POST /v1/responses。
+        """
+        wire_models = resolve_fallback_litellm_wire_models(
+            model,
+            config.llm_model_list,
+        )
         register_fallback_model_pricing(wire_models)
+
         effective_kwargs = dict(call_kwargs)
-        if use_channel_router and self._router and model in router_model_names:
+
+        # =====================================================
+        # Responses API 模式
+        # =====================================================
+        if _use_responses_api(model):
+            messages = effective_kwargs.pop("messages", []) or []
+
+            instructions: List[str] = []
+            response_input: List[Dict[str, Any]] = []
+
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+
+                role = str(message.get("role") or "user").strip()
+                content = message.get("content", "")
+
+                if role in {"system", "developer"}:
+                    if isinstance(content, str) and content.strip():
+                        instructions.append(content.strip())
+                    continue
+
+                response_input.append(
+                    {
+                        "role": role,
+                        "content": content,
+                    }
+                )
+
+            # Chat Completions 使用 max_tokens；
+            # Responses API 使用 max_output_tokens。
+            max_tokens = effective_kwargs.pop("max_tokens", None)
+
+            if max_tokens is not None:
+                effective_kwargs.setdefault(
+                    "max_output_tokens",
+                    max_tokens,
+                )
+
+            if instructions:
+                effective_kwargs["instructions"] = "\n\n".join(instructions)
+
+            effective_kwargs["input"] = (
+                response_input if response_input else ""
+            )
+
+            # 当前先采用非流式 Responses API。
+            # 原项目的流式解析器处理的是 choices.delta，
+            # 与 Responses API 事件格式不同。
+            effective_kwargs.pop("stream", None)
+
+            # Responses 模式不经过原来的 Router.completion，
+            # 因为该路径仍会发送 Chat Completions 请求。
+            keys = get_api_keys_for_model(model, config)
+
+            if keys and not effective_kwargs.get("api_key"):
+                effective_kwargs["api_key"] = keys[0]
+
+            extra_params = extra_litellm_params(model, config)
+
+            for key, value in extra_params.items():
+                effective_kwargs.setdefault(key, value)
+
+            responses_function = getattr(litellm, "responses", None)
+
+            if responses_function is None:
+                from litellm.responses.main import responses
+
+                responses_function = responses
+
+            logger.info(
+                "[LiteLLM] %s 使用 Responses API",
+                model,
+            )
+
+            return responses_function(**effective_kwargs)
+
+        # =====================================================
+        # 原有 Chat Completions 模式
+        # =====================================================
+        if (
+            use_channel_router
+            and self._router
+            and model in router_model_names
+        ):
             return self._router.completion(**effective_kwargs)
-        if self._router and model == config.litellm_model and not use_channel_router:
+
+        if (
+            self._router
+            and model == config.litellm_model
+            and not use_channel_router
+        ):
             return self._router.completion(**effective_kwargs)
 
         keys = get_api_keys_for_model(model, config)
+
         if keys:
             effective_kwargs["api_key"] = keys[0]
-        effective_kwargs.update(extra_litellm_params(model, config))
+
+        effective_kwargs.update(
+            extra_litellm_params(model, config)
+        )
+
         return litellm.completion(**effective_kwargs)
 
     def _normalize_usage(
@@ -2417,32 +2543,107 @@ class GeminiAnalyzer:
         return "".join(parts).strip()
 
     def _extract_completion_text(self, response: Any) -> str:
-        """Extract text from non-stream LiteLLM completion responses."""
-        choices = self._get_response_field(response, "choices")
+        """
+        同时解析 Responses API 和 Chat Completions API 返回结果。
+        """
+
+        # =====================================================
+        # OpenAI Responses API：优先读取 output_text
+        # =====================================================
+        output_text = self._get_response_field(
+            response,
+            "output_text",
+        )
+
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+        # 某些兼容网关不提供 output_text，
+        # 需要从 output[].content[].text 中读取。
+        output_items = self._get_response_field(
+            response,
+            "output",
+        )
+
+        if output_items:
+            response_parts: List[str] = []
+
+            for item in output_items:
+                content_blocks = self._get_response_field(
+                    item,
+                    "content",
+                )
+
+                block_text = self._extract_text_blocks(
+                    content_blocks
+                )
+
+                if block_text:
+                    response_parts.append(block_text)
+
+            if response_parts:
+                return "\n".join(response_parts).strip()
+
+        # =====================================================
+        # 原有 Chat Completions API：choices[0].message.content
+        # =====================================================
+        choices = self._get_response_field(
+            response,
+            "choices",
+        )
+
         if not choices:
             return ""
 
         choice = choices[0]
-        message = self._get_response_field(choice, "message")
+        message = self._get_response_field(
+            choice,
+            "message",
+        )
 
-        content_blocks = self._get_response_field(choice, "content_blocks")
+        content_blocks = self._get_response_field(
+            choice,
+            "content_blocks",
+        )
+
         if content_blocks is None and message is not None:
-            content_blocks = self._get_response_field(message, "content_blocks")
-        block_text = self._extract_text_blocks(content_blocks)
+            content_blocks = self._get_response_field(
+                message,
+                "content_blocks",
+            )
+
+        block_text = self._extract_text_blocks(
+            content_blocks
+        )
+
         if block_text:
             return block_text
 
         content = None
+
         if message is not None:
-            content = self._get_response_field(message, "content")
+            content = self._get_response_field(
+                message,
+                "content",
+            )
+
         if content is None:
-            content = self._get_response_field(choice, "content")
+            content = self._get_response_field(
+                choice,
+                "content",
+            )
 
         if isinstance(content, list):
             return self._extract_text_blocks(content)
+
         if isinstance(content, str):
             return content.strip()
-        return str(content).strip() if content is not None else ""
+
+        return (
+            str(content).strip()
+            if content is not None
+            else ""
+        )
 
     def _extract_stream_text(self, chunk: Any) -> str:
         """Extract provider-agnostic text delta from a LiteLLM streaming chunk."""
@@ -2646,7 +2847,7 @@ class GeminiAnalyzer:
                 _stream_text: Optional[str] = None
                 _stream_usage: Dict[str, Any] = {}
 
-                if stream:
+                if stream and not _use_responses_api(model):
                     try:
                         stream_response = call_litellm_with_param_recovery(
                             lambda kwargs: self._dispatch_litellm_completion(
